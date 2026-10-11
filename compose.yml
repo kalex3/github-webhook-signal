@@ -1,0 +1,37 @@
+services:
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      - TUNNEL_URL=http://github-webhook:8080
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?}
+    networks:
+      - cloudflared
+
+  github-webhook:
+    build: .
+    image: github-webhook:latest
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - SIGNAL_API=http://signal-cli:8080
+      - SIGNAL_RECIPIENT=${SIGNAL_RECIPIENT:?}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:?}
+    networks:
+      - cloudflared
+      - signal-cli
+
+  signal-cli:
+    image: ghcr.io/asamk/signal-cli:latest-native
+    restart: unless-stopped
+    command: -a ${SIGNAL_ACCOUNT:?} daemon --http=0.0.0.0:8080
+    volumes:
+      - ./signal-cli:/var/lib/signal-cli
+    networks:
+      - signal-cli
+
+networks:
+  cloudflared:
+  signal-cli:
