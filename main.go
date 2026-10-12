@@ -21,10 +21,20 @@ import (
 const maxBodySize = 1 << 20 // 1 MiB
 
 type Config struct {
-	Port        string
+	Port          string
 	WebhookSecret string
-	SignalAPI   string
-	Recipient   string
+	SignalAPI     string
+	Recipient     string
+}
+
+type repository struct {
+	FullName string `json:"full_name"`
+	HTMLURL  string `json:"html_url"`
+}
+
+type actor struct {
+	Login string `json:"login"`
+	Name  string `json:"name"`
 }
 
 type Commit struct {
@@ -32,16 +42,143 @@ type Commit struct {
 	Message string `json:"message"`
 }
 
-type Payload struct {
-	Ref string `json:"ref"`
-	Pusher struct {
-		Name string `json:"name"`
-	} `json:"pusher"`
-	Repository struct {
+type pushPayload struct {
+	Ref        string     `json:"ref"`
+	Compare    string     `json:"compare"`
+	Pusher     actor      `json:"pusher"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+	Commits    []Commit   `json:"commits"`
+}
+
+type workflowRunPayload struct {
+	Action      string `json:"action"`
+	WorkflowRun struct {
+		Name         string `json:"name"`
+		HTMLURL      string `json:"html_url"`
+		Status       string `json:"status"`
+		Conclusion   string `json:"conclusion"`
+		Event        string `json:"event"`
+		HeadBranch   string `json:"head_branch"`
+		DisplayTitle string `json:"display_title"`
+		Actor        actor  `json:"actor"`
+	} `json:"workflow_run"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type checkRunPayload struct {
+	Action   string `json:"action"`
+	CheckRun struct {
+		Name       string `json:"name"`
+		HTMLURL    string `json:"html_url"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		HeadSHA    string `json:"head_sha"`
+		CheckSuite struct {
+			HeadBranch string `json:"head_branch"`
+		} `json:"check_suite"`
+	} `json:"check_run"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type pageBuildPayload struct {
+	Build struct {
+		Status string `json:"status"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Commit string `json:"commit"`
+		Pusher actor  `json:"pusher"`
+	} `json:"build"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type deploymentStatusPayload struct {
+	DeploymentStatus struct {
+		State       string `json:"state"`
+		Description string `json:"description"`
+		TargetURL   string `json:"target_url"`
+		Environment string `json:"environment"`
+		LogURL      string `json:"log_url"`
+	} `json:"deployment_status"`
+	Deployment struct {
+		Environment string `json:"environment"`
+		Ref         string `json:"ref"`
+		SHA         string `json:"sha"`
+		Description string `json:"description"`
+	} `json:"deployment"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type pullRequestPayload struct {
+	Action      string `json:"action"`
+	Number      int    `json:"number"`
+	PullRequest struct {
+		Title   string `json:"title"`
+		HTMLURL string `json:"html_url"`
+		Merged  bool   `json:"merged"`
+		User    actor  `json:"user"`
+		Head    struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	} `json:"pull_request"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type releasePayload struct {
+	Action  string `json:"action"`
+	Release struct {
+		TagName    string `json:"tag_name"`
+		Name       string `json:"name"`
+		HTMLURL    string `json:"html_url"`
+		Draft      bool   `json:"draft"`
+		Prerelease bool   `json:"prerelease"`
+		Author     actor  `json:"author"`
+	} `json:"release"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type issuesPayload struct {
+	Action string `json:"action"`
+	Issue  struct {
+		Number  int    `json:"number"`
+		Title   string `json:"title"`
+		HTMLURL string `json:"html_url"`
+		User    actor  `json:"user"`
+	} `json:"issue"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type createDeletePayload struct {
+	Ref        string     `json:"ref"`
+	RefType    string     `json:"ref_type"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type starPayload struct {
+	Action     string     `json:"action"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
+}
+
+type forkPayload struct {
+	Forkee struct {
 		FullName string `json:"full_name"`
-	} `json:"repository"`
-	Commits []Commit `json:"commits"`
-	Compare string `json:"compare"`
+		HTMLURL  string `json:"html_url"`
+	} `json:"forkee"`
+	Sender     actor      `json:"sender"`
+	Repository repository `json:"repository"`
 }
 
 type RPCResponse struct {
@@ -95,59 +232,386 @@ func firstLine(s string) string {
 	return strings.TrimSuffix(line, "\r")
 }
 
-func buildMessage(p Payload) string {
-	repo := p.Repository.FullName
-	if repo == "" {
-		repo = "unknown repository"
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
 	}
+	return string(runes[:n])
+}
 
+func shortSHA(id string) string {
+	if len(id) > 7 {
+		return id[:7]
+	}
+	if id == "" {
+		return "unknown"
+	}
+	return id
+}
+
+func repoName(r repository) string {
+	if r.FullName == "" {
+		return "unknown repository"
+	}
+	return r.FullName
+}
+
+func actorName(a ...actor) string {
+	for _, person := range a {
+		if person.Name != "" {
+			return person.Name
+		}
+		if person.Login != "" {
+			return person.Login
+		}
+	}
+	return "unknown"
+}
+
+func appendURL(b *strings.Builder, urls ...string) {
+	for _, u := range urls {
+		if u != "" {
+			b.WriteString("\n\n")
+			b.WriteString(u)
+			return
+		}
+	}
+}
+
+func orEmpty(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func buildPushMessage(p pushPayload) string {
 	branch := strings.TrimPrefix(p.Ref, "refs/heads/")
-	if branch == "" {
+	if strings.HasPrefix(p.Ref, "refs/tags/") {
+		branch = "tag " + strings.TrimPrefix(p.Ref, "refs/tags/")
+	} else if branch == "" {
 		branch = "unknown"
-	}
-
-	pusher := p.Pusher.Name
-	if pusher == "" {
-		pusher = "unknown"
 	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "GitHub push: %s\nBranch: %s\nBy: %s\nCommits: %d",
-		repo, branch, pusher, len(p.Commits))
+		repoName(p.Repository), branch, actorName(p.Pusher, p.Sender), len(p.Commits))
 
 	for i, commit := range p.Commits {
 		if i >= 5 {
 			break
 		}
-
-		message := []rune(firstLine(commit.Message))
-		if len(message) > 150 {
-			message = message[:150]
-		}
-
-		id := commit.ID
-		if len(id) > 7 {
-			id = id[:7]
-		}
-		if id == "" {
-			id = "unknown"
-		}
-
 		if i == 0 {
 			b.WriteString("\n\n")
 		} else {
 			b.WriteByte('\n')
 		}
-
-		fmt.Fprintf(&b, "- %s %s", id, string(message))
+		fmt.Fprintf(&b, "- %s %s", shortSHA(commit.ID), truncate(firstLine(commit.Message), 150))
 	}
 
-	if p.Compare != "" {
-		b.WriteString("\n\n")
-		b.WriteString(p.Compare)
-	}
-
+	appendURL(&b, p.Compare)
 	return b.String()
+}
+
+func buildWorkflowRunMessage(p workflowRunPayload) (string, bool) {
+	if p.Action != "completed" {
+		return "", false
+	}
+
+	run := p.WorkflowRun
+	title := orEmpty(run.DisplayTitle, run.Name)
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub CI: %s\nWorkflow: %s\nConclusion: %s\nBranch: %s\nBy: %s",
+		repoName(p.Repository),
+		orEmpty(run.Name, "unknown"),
+		orEmpty(run.Conclusion, "unknown"),
+		orEmpty(run.HeadBranch, "unknown"),
+		actorName(run.Actor, p.Sender),
+	)
+	if title != "" && title != run.Name {
+		fmt.Fprintf(&b, "\nTitle: %s", truncate(title, 150))
+	}
+	appendURL(&b, run.HTMLURL)
+	return b.String(), true
+}
+
+func buildCheckRunMessage(p checkRunPayload) (string, bool) {
+	if p.Action != "completed" {
+		return "", false
+	}
+
+	run := p.CheckRun
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub check: %s\nCheck: %s\nConclusion: %s\nBranch: %s\nCommit: %s\nBy: %s",
+		repoName(p.Repository),
+		orEmpty(run.Name, "unknown"),
+		orEmpty(run.Conclusion, "unknown"),
+		orEmpty(run.CheckSuite.HeadBranch, "unknown"),
+		shortSHA(run.HeadSHA),
+		actorName(p.Sender),
+	)
+	appendURL(&b, run.HTMLURL)
+	return b.String(), true
+}
+
+func buildPageBuildMessage(p pageBuildPayload) (string, bool) {
+	status := p.Build.Status
+	if status != "built" && status != "errored" {
+		return "", false
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub Pages: %s\nStatus: %s\nCommit: %s\nBy: %s",
+		repoName(p.Repository),
+		status,
+		shortSHA(p.Build.Commit),
+		actorName(p.Build.Pusher, p.Sender),
+	)
+	if status == "errored" && p.Build.Error.Message != "" {
+		fmt.Fprintf(&b, "\nError: %s", truncate(firstLine(p.Build.Error.Message), 200))
+	}
+	appendURL(&b, p.Repository.HTMLURL)
+	return b.String(), true
+}
+
+func buildDeploymentStatusMessage(p deploymentStatusPayload) (string, bool) {
+	state := p.DeploymentStatus.State
+	switch state {
+	case "success", "failure", "error":
+	default:
+		return "", false
+	}
+
+	envName := p.DeploymentStatus.Environment
+	if envName == "" {
+		envName = p.Deployment.Environment
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub deploy: %s\nEnvironment: %s\nState: %s\nRef: %s\nBy: %s",
+		repoName(p.Repository),
+		orEmpty(envName, "unknown"),
+		state,
+		orEmpty(p.Deployment.Ref, shortSHA(p.Deployment.SHA)),
+		actorName(p.Sender),
+	)
+	desc := p.DeploymentStatus.Description
+	if desc == "" {
+		desc = p.Deployment.Description
+	}
+	if desc != "" {
+		fmt.Fprintf(&b, "\n%s", truncate(firstLine(desc), 200))
+	}
+	appendURL(&b, p.DeploymentStatus.LogURL, p.DeploymentStatus.TargetURL, p.Repository.HTMLURL)
+	return b.String(), true
+}
+
+func buildPullRequestMessage(p pullRequestPayload) (string, bool) {
+	action := p.Action
+	switch action {
+	case "opened", "reopened", "closed", "ready_for_review", "converted_to_draft":
+	default:
+		return "", false
+	}
+
+	if action == "closed" && p.PullRequest.Merged {
+		action = "merged"
+	}
+
+	pr := p.PullRequest
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub PR: %s\n#%d %s: %s\n%s → %s\nBy: %s",
+		repoName(p.Repository),
+		p.Number,
+		action,
+		truncate(orEmpty(pr.Title, "untitled"), 150),
+		orEmpty(pr.Head.Ref, "?"),
+		orEmpty(pr.Base.Ref, "?"),
+		actorName(pr.User, p.Sender),
+	)
+	appendURL(&b, pr.HTMLURL)
+	return b.String(), true
+}
+
+func buildReleaseMessage(p releasePayload) (string, bool) {
+	switch p.Action {
+	case "published", "released":
+	default:
+		return "", false
+	}
+
+	rel := p.Release
+	kind := "release"
+	if rel.Prerelease {
+		kind = "prerelease"
+	}
+	name := rel.Name
+	if name == "" || name == rel.TagName {
+		name = rel.TagName
+	} else {
+		name = rel.TagName + " (" + name + ")"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub %s: %s\n%s\nBy: %s",
+		kind,
+		repoName(p.Repository),
+		orEmpty(name, "unknown"),
+		actorName(rel.Author, p.Sender),
+	)
+	appendURL(&b, rel.HTMLURL)
+	return b.String(), true
+}
+
+func buildIssuesMessage(p issuesPayload) (string, bool) {
+	switch p.Action {
+	case "opened", "reopened", "closed":
+	default:
+		return "", false
+	}
+
+	issue := p.Issue
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub issue: %s\n#%d %s: %s\nBy: %s",
+		repoName(p.Repository),
+		issue.Number,
+		p.Action,
+		truncate(orEmpty(issue.Title, "untitled"), 150),
+		actorName(issue.User, p.Sender),
+	)
+	appendURL(&b, issue.HTMLURL)
+	return b.String(), true
+}
+
+func buildCreateDeleteMessage(event string, p createDeletePayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub %s: %s\n%s %s\nBy: %s",
+		event,
+		repoName(p.Repository),
+		orEmpty(p.RefType, "ref"),
+		orEmpty(p.Ref, "unknown"),
+		actorName(p.Sender),
+	)
+	appendURL(&b, p.Repository.HTMLURL)
+	return b.String()
+}
+
+func buildStarMessage(p starPayload) (string, bool) {
+	if p.Action != "created" {
+		return "", false
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub star: %s\nBy: %s", repoName(p.Repository), actorName(p.Sender))
+	appendURL(&b, p.Repository.HTMLURL)
+	return b.String(), true
+}
+
+func buildForkMessage(p forkPayload) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "GitHub fork: %s\nTo: %s\nBy: %s",
+		repoName(p.Repository),
+		orEmpty(p.Forkee.FullName, "unknown"),
+		actorName(p.Sender),
+	)
+	appendURL(&b, p.Forkee.HTMLURL, p.Repository.HTMLURL)
+	return b.String()
+}
+
+// buildMessage returns a Signal notification body and whether one should be sent.
+func buildMessage(event string, body []byte) (string, bool, error) {
+	switch event {
+	case "ping":
+		return "", false, nil
+
+	case "push":
+		var p pushPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		return buildPushMessage(p), true, nil
+
+	case "workflow_run":
+		var p workflowRunPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildWorkflowRunMessage(p)
+		return msg, ok, nil
+
+	case "check_run":
+		var p checkRunPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildCheckRunMessage(p)
+		return msg, ok, nil
+
+	case "page_build":
+		var p pageBuildPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildPageBuildMessage(p)
+		return msg, ok, nil
+
+	case "deployment_status":
+		var p deploymentStatusPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildDeploymentStatusMessage(p)
+		return msg, ok, nil
+
+	case "pull_request":
+		var p pullRequestPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildPullRequestMessage(p)
+		return msg, ok, nil
+
+	case "release":
+		var p releasePayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildReleaseMessage(p)
+		return msg, ok, nil
+
+	case "issues":
+		var p issuesPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildIssuesMessage(p)
+		return msg, ok, nil
+
+	case "create", "delete":
+		var p createDeletePayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		return buildCreateDeleteMessage(event, p), true, nil
+
+	case "star":
+		var p starPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		msg, ok := buildStarMessage(p)
+		return msg, ok, nil
+
+	case "fork":
+		var p forkPayload
+		if err := json.Unmarshal(body, &p); err != nil {
+			return "", false, err
+		}
+		return buildForkMessage(p), true, nil
+
+	default:
+		return "", false, nil
+	}
 }
 
 func sendSignal(cfg Config, message string) error {
@@ -232,25 +696,25 @@ func webhook(cfg Config) http.HandlerFunc {
 			return
 		}
 
-		if r.Header.Get("X-GitHub-Event") != "push" {
-			http.Error(w, "Event ignored", http.StatusOK)
-			return
-		}
-
-		var p Payload
-		if err := json.Unmarshal(body, &p); err != nil {
+		event := r.Header.Get("X-GitHub-Event")
+		message, notify, err := buildMessage(event, body)
+		if err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
+		if !notify {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("Event ignored"))
+			return
+		}
 
-		if err := sendSignal(cfg, buildMessage(p)); err != nil {
-			log.Printf("Signal delivery failed: %v", err)
+		if err := sendSignal(cfg, message); err != nil {
+			log.Printf("Signal delivery failed for %s: %v", event, err)
 			http.Error(w, "Signal delivery failed", http.StatusBadGateway)
 			return
 		}
 
-		log.Printf("Signal notification sent for %s:%s",
-			p.Repository.FullName, strings.TrimPrefix(p.Ref, "refs/heads/"))
+		log.Printf("Signal notification sent for %s", event)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("Notification sent"))
 	}
