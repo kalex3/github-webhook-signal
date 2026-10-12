@@ -22,6 +22,7 @@ const maxBodySize = 1 << 20 // 1 MiB
 
 type Config struct {
 	Port          string
+	WebhookPath   string
 	WebhookSecret string
 	SignalAPI     string
 	Recipient     string
@@ -192,9 +193,24 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+func normalizePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "/webhook"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if len(path) > 1 {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
+}
+
 func loadConfig() Config {
 	cfg := Config{
 		Port:          env("PORT", "8080"),
+		WebhookPath:   normalizePath(env("WEBHOOK_PATH", "/webhook")),
 		WebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		SignalAPI:     strings.TrimRight(env("SIGNAL_API", "http://signal-cli:8080"), "/"),
 		Recipient:     os.Getenv("SIGNAL_RECIPIENT"),
@@ -724,7 +740,7 @@ func main() {
 	cfg := loadConfig()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/webhook", webhook(cfg))
+	mux.HandleFunc(cfg.WebhookPath, webhook(cfg))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -739,6 +755,6 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("GitHub webhook receiver listening on port %s", cfg.Port)
+	log.Printf("GitHub webhook receiver listening on port %s path %s", cfg.Port, cfg.WebhookPath)
 	log.Fatal(server.ListenAndServe())
 }
