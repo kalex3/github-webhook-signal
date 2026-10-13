@@ -285,16 +285,6 @@ func actorName(a ...actor) string {
 	return "unknown"
 }
 
-func appendURL(b *strings.Builder, urls ...string) {
-	for _, u := range urls {
-		if u != "" {
-			b.WriteString("\n\n")
-			b.WriteString(u)
-			return
-		}
-	}
-}
-
 func orEmpty(v, fallback string) string {
 	if v == "" {
 		return fallback
@@ -302,101 +292,282 @@ func orEmpty(v, fallback string) string {
 	return v
 }
 
-func buildPushMessage(p pushPayload) string {
-	branch := strings.TrimPrefix(p.Ref, "refs/heads/")
-	if strings.HasPrefix(p.Ref, "refs/tags/") {
-		branch = "tag " + strings.TrimPrefix(p.Ref, "refs/tags/")
-	} else if branch == "" {
-		branch = "unknown"
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub push: %s\nBranch: %s\nBy: %s\nCommits: %d",
-		repoName(p.Repository), branch, actorName(p.Pusher, p.Sender), len(p.Commits))
-
-	for i, commit := range p.Commits {
-		if i >= 5 {
-			break
-		}
-		if i == 0 {
-			b.WriteString("\n\n")
-		} else {
-			b.WriteByte('\n')
-		}
-		fmt.Fprintf(&b, "- %s %s", shortSHA(commit.ID), truncate(firstLine(commit.Message), 150))
-	}
-
-	appendURL(&b, p.Compare)
-	return b.String()
+func prettyAction(action string) string {
+	return strings.ReplaceAll(action, "_", " ")
 }
 
-func buildWorkflowRunMessage(p workflowRunPayload) (string, bool) {
+// utf16Len is the length in UTF-16 code units. signal-cli text styles use that
+// unit, so emoji (which sit outside the BMP) count as two.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// signalText is a Signal message plus text-style ranges (start:length:STYLE).
+type signalText struct {
+	body   string
+	styles []string
+}
+
+type textBuilder struct {
+	b      strings.Builder
+	styles []string
+	off    int
+}
+
+func (w *textBuilder) write(s string) {
+	if s == "" {
+		return
+	}
+	w.b.WriteString(s)
+	w.off += utf16Len(s)
+}
+
+func (w *textBuilder) style(s, style string) {
+	if s == "" {
+		return
+	}
+	start := w.off
+	w.write(s)
+	w.styles = append(w.styles, fmt.Sprintf("%d:%d:%s", start, w.off-start, style))
+}
+
+func (w *textBuilder) bold(s string)   { w.style(s, "BOLD") }
+func (w *textBuilder) italic(s string) { w.style(s, "ITALIC") }
+func (w *textBuilder) mono(s string)   { w.style(s, "MONOSPACE") }
+func (w *textBuilder) strike(s string) { w.style(s, "STRIKETHROUGH") }
+func (w *textBuilder) nl()             { w.write("\n") }
+
+func (w *textBuilder) header(emoji, title, subject string) {
+	if emoji != "" {
+		w.write(emoji)
+		w.write(" ")
+	}
+	w.bold(title)
+	if subject != "" {
+		w.write(" · ")
+		w.bold(subject)
+	}
+	w.nl()
+}
+
+func (w *textBuilder) field(label, value string) {
+	w.bold(label)
+	w.write(": ")
+	w.write(value)
+	w.nl()
+}
+
+func (w *textBuilder) prose(s string, strike bool) {
+	if strike {
+		w.strike(s)
+		return
+	}
+	w.italic(s)
+}
+
+func (w *textBuilder) link(urls ...string) {
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		if !strings.HasSuffix(w.b.String(), "\n") {
+			w.nl()
+		}
+		w.nl()
+		w.write(u)
+		return
+	}
+}
+
+func (w *textBuilder) done() signalText {
+	return signalText{
+		body:   strings.TrimRight(w.b.String(), "\n"),
+		styles: w.styles,
+	}
+}
+
+func outcomeEmoji(outcome string) string {
+	switch outcome {
+	case "success", "built":
+		return "✅"
+	case "failure", "failed", "error", "errored":
+		return "❌"
+	case "cancelled", "canceled":
+		return "🚫"
+	case "timed_out":
+		return "⏱️"
+	case "skipped":
+		return "⏭️"
+	case "neutral":
+		return "⚪"
+	case "action_required", "stale":
+		return "⚠️"
+	default:
+		return "⚙️"
+	}
+}
+
+func prEmoji(action string) string {
+	switch action {
+	case "merged":
+		return "🎉"
+	case "opened":
+		return "🔀"
+	case "reopened":
+		return "🔁"
+	case "closed":
+		return "🚫"
+	case "ready_for_review":
+		return "👀"
+	case "converted_to_draft":
+		return "📝"
+	default:
+		return "🔀"
+	}
+}
+
+func issueEmoji(action string) string {
+	switch action {
+	case "opened":
+		return "🐛"
+	case "reopened":
+		return "🔁"
+	case "closed":
+		return "✅"
+	default:
+		return "🐛"
+	}
+}
+
+func buildPushMessage(p pushPayload) signalText {
+	refLabel := "Branch"
+	ref := strings.TrimPrefix(p.Ref, "refs/heads/")
+	emoji := "📤"
+	title := "Push"
+	if strings.HasPrefix(p.Ref, "refs/tags/") {
+		ref = strings.TrimPrefix(p.Ref, "refs/tags/")
+		refLabel = "Tag"
+		emoji = "🏷️"
+		title = "Tag push"
+	} else if ref == "" {
+		ref = "unknown"
+	}
+
+	var w textBuilder
+	w.header(emoji, title, repoName(p.Repository))
+	w.field(refLabel, ref)
+	w.field("By", actorName(p.Pusher, p.Sender))
+	w.field("Commits", strconv.Itoa(len(p.Commits)))
+
+	shown := 0
+	for _, commit := range p.Commits {
+		if shown >= 5 {
+			break
+		}
+		if shown == 0 {
+			w.nl()
+		}
+		shown++
+		w.write("• ")
+		w.mono(shortSHA(commit.ID))
+		w.write(" ")
+		w.italic(truncate(firstLine(commit.Message), 150))
+		w.nl()
+	}
+	if len(p.Commits) > shown {
+		w.italic(fmt.Sprintf("… and %d more", len(p.Commits)-shown))
+		w.nl()
+	}
+
+	w.link(p.Compare)
+	return w.done()
+}
+
+func buildWorkflowRunMessage(p workflowRunPayload) (signalText, bool) {
 	if p.Action != "completed" {
-		return "", false
+		return signalText{}, false
 	}
 
 	run := p.WorkflowRun
 	title := orEmpty(run.DisplayTitle, run.Name)
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub CI: %s\nWorkflow: %s\nConclusion: %s\nBranch: %s\nBy: %s",
-		repoName(p.Repository),
-		orEmpty(run.Name, "unknown"),
-		orEmpty(run.Conclusion, "unknown"),
-		orEmpty(run.HeadBranch, "unknown"),
-		actorName(run.Actor, p.Sender),
-	)
+	conclusion := orEmpty(run.Conclusion, "unknown")
+
+	var w textBuilder
+	w.header(outcomeEmoji(conclusion), "CI", repoName(p.Repository))
+	w.field("Workflow", orEmpty(run.Name, "unknown"))
+	w.field("Conclusion", conclusion)
+	w.field("Branch", orEmpty(run.HeadBranch, "unknown"))
+	w.field("By", actorName(run.Actor, p.Sender))
 	if title != "" && title != run.Name {
-		fmt.Fprintf(&b, "\nTitle: %s", truncate(title, 150))
+		w.bold("Title")
+		w.write(": ")
+		w.italic(truncate(title, 150))
+		w.nl()
 	}
-	appendURL(&b, run.HTMLURL)
-	return b.String(), true
+	w.link(run.HTMLURL)
+	return w.done(), true
 }
 
-func buildCheckRunMessage(p checkRunPayload) (string, bool) {
+func buildCheckRunMessage(p checkRunPayload) (signalText, bool) {
 	if p.Action != "completed" {
-		return "", false
+		return signalText{}, false
 	}
 
 	run := p.CheckRun
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub check: %s\nCheck: %s\nConclusion: %s\nBranch: %s\nCommit: %s\nBy: %s",
-		repoName(p.Repository),
-		orEmpty(run.Name, "unknown"),
-		orEmpty(run.Conclusion, "unknown"),
-		orEmpty(run.CheckSuite.HeadBranch, "unknown"),
-		shortSHA(run.HeadSHA),
-		actorName(p.Sender),
-	)
-	appendURL(&b, run.HTMLURL)
-	return b.String(), true
+	conclusion := orEmpty(run.Conclusion, "unknown")
+
+	var w textBuilder
+	w.header(outcomeEmoji(conclusion), "Check", repoName(p.Repository))
+	w.field("Check", orEmpty(run.Name, "unknown"))
+	w.field("Conclusion", conclusion)
+	w.field("Branch", orEmpty(run.CheckSuite.HeadBranch, "unknown"))
+	w.bold("Commit")
+	w.write(": ")
+	w.mono(shortSHA(run.HeadSHA))
+	w.nl()
+	w.field("By", actorName(p.Sender))
+	w.link(run.HTMLURL)
+	return w.done(), true
 }
 
-func buildPageBuildMessage(p pageBuildPayload) (string, bool) {
+func buildPageBuildMessage(p pageBuildPayload) (signalText, bool) {
 	status := p.Build.Status
 	if status != "built" && status != "errored" {
-		return "", false
+		return signalText{}, false
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub Pages: %s\nStatus: %s\nCommit: %s\nBy: %s",
-		repoName(p.Repository),
-		status,
-		shortSHA(p.Build.Commit),
-		actorName(p.Build.Pusher, p.Sender),
-	)
+	var w textBuilder
+	w.header(outcomeEmoji(status), "Pages", repoName(p.Repository))
+	w.field("Status", status)
+	w.bold("Commit")
+	w.write(": ")
+	w.mono(shortSHA(p.Build.Commit))
+	w.nl()
+	w.field("By", actorName(p.Build.Pusher, p.Sender))
 	if status == "errored" && p.Build.Error.Message != "" {
-		fmt.Fprintf(&b, "\nError: %s", truncate(firstLine(p.Build.Error.Message), 200))
+		w.bold("Error")
+		w.write(": ")
+		w.italic(truncate(firstLine(p.Build.Error.Message), 200))
+		w.nl()
 	}
-	appendURL(&b, p.Repository.HTMLURL)
-	return b.String(), true
+	w.link(p.Repository.HTMLURL)
+	return w.done(), true
 }
 
-func buildDeploymentStatusMessage(p deploymentStatusPayload) (string, bool) {
+func buildDeploymentStatusMessage(p deploymentStatusPayload) (signalText, bool) {
 	state := p.DeploymentStatus.State
 	switch state {
 	case "success", "failure", "error":
 	default:
-		return "", false
+		return signalText{}, false
 	}
 
 	envName := p.DeploymentStatus.Environment
@@ -404,31 +575,38 @@ func buildDeploymentStatusMessage(p deploymentStatusPayload) (string, bool) {
 		envName = p.Deployment.Environment
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub deploy: %s\nEnvironment: %s\nState: %s\nRef: %s\nBy: %s",
-		repoName(p.Repository),
-		orEmpty(envName, "unknown"),
-		state,
-		orEmpty(p.Deployment.Ref, shortSHA(p.Deployment.SHA)),
-		actorName(p.Sender),
-	)
+	emoji := outcomeEmoji(state)
+	if state == "success" {
+		emoji = "🚀"
+	}
+
+	var w textBuilder
+	w.header(emoji, "Deploy", repoName(p.Repository))
+	w.field("Environment", orEmpty(envName, "unknown"))
+	w.field("State", state)
+	w.bold("Ref")
+	w.write(": ")
+	w.mono(orEmpty(p.Deployment.Ref, shortSHA(p.Deployment.SHA)))
+	w.nl()
+	w.field("By", actorName(p.Sender))
 	desc := p.DeploymentStatus.Description
 	if desc == "" {
 		desc = p.Deployment.Description
 	}
 	if desc != "" {
-		fmt.Fprintf(&b, "\n%s", truncate(firstLine(desc), 200))
+		w.italic(truncate(firstLine(desc), 200))
+		w.nl()
 	}
-	appendURL(&b, p.DeploymentStatus.LogURL, p.DeploymentStatus.TargetURL, p.Repository.HTMLURL)
-	return b.String(), true
+	w.link(p.DeploymentStatus.LogURL, p.DeploymentStatus.TargetURL, p.Repository.HTMLURL)
+	return w.done(), true
 }
 
-func buildPullRequestMessage(p pullRequestPayload) (string, bool) {
+func buildPullRequestMessage(p pullRequestPayload) (signalText, bool) {
 	action := p.Action
 	switch action {
 	case "opened", "reopened", "closed", "ready_for_review", "converted_to_draft":
 	default:
-		return "", false
+		return signalText{}, false
 	}
 
 	if action == "closed" && p.PullRequest.Merged {
@@ -436,121 +614,136 @@ func buildPullRequestMessage(p pullRequestPayload) (string, bool) {
 	}
 
 	pr := p.PullRequest
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub PR: %s\n#%d %s: %s\n%s → %s\nBy: %s",
-		repoName(p.Repository),
-		p.Number,
-		action,
-		truncate(orEmpty(pr.Title, "untitled"), 150),
-		orEmpty(pr.Head.Ref, "?"),
-		orEmpty(pr.Base.Ref, "?"),
-		actorName(pr.User, p.Sender),
-	)
-	appendURL(&b, pr.HTMLURL)
-	return b.String(), true
+	var w textBuilder
+	w.header(prEmoji(action), "PR", repoName(p.Repository))
+	w.write("#")
+	w.bold(strconv.Itoa(p.Number))
+	w.write(" ")
+	w.bold(prettyAction(action))
+	w.write(": ")
+	w.prose(truncate(orEmpty(pr.Title, "untitled"), 150), action == "closed")
+	w.nl()
+	w.mono(orEmpty(pr.Head.Ref, "?"))
+	w.write(" → ")
+	w.mono(orEmpty(pr.Base.Ref, "?"))
+	w.nl()
+	w.field("By", actorName(pr.User, p.Sender))
+	w.link(pr.HTMLURL)
+	return w.done(), true
 }
 
-func buildReleaseMessage(p releasePayload) (string, bool) {
+func buildReleaseMessage(p releasePayload) (signalText, bool) {
 	switch p.Action {
 	case "published", "released":
 	default:
-		return "", false
+		return signalText{}, false
 	}
 
 	rel := p.Release
-	kind := "release"
+	kind := "Release"
+	emoji := "🏷️"
 	if rel.Prerelease {
-		kind = "prerelease"
+		kind = "Prerelease"
+		emoji = "🧪"
 	}
 	name := rel.Name
 	if name == "" || name == rel.TagName {
 		name = rel.TagName
-	} else {
-		name = rel.TagName + " (" + name + ")"
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub %s: %s\n%s\nBy: %s",
-		kind,
-		repoName(p.Repository),
-		orEmpty(name, "unknown"),
-		actorName(rel.Author, p.Sender),
-	)
-	appendURL(&b, rel.HTMLURL)
-	return b.String(), true
+	var w textBuilder
+	w.header(emoji, kind, repoName(p.Repository))
+	w.bold(orEmpty(rel.TagName, "unknown"))
+	if name != "" && name != rel.TagName {
+		w.write(" ")
+		w.italic("(" + name + ")")
+	}
+	w.nl()
+	w.field("By", actorName(rel.Author, p.Sender))
+	w.link(rel.HTMLURL)
+	return w.done(), true
 }
 
-func buildIssuesMessage(p issuesPayload) (string, bool) {
+func buildIssuesMessage(p issuesPayload) (signalText, bool) {
 	switch p.Action {
 	case "opened", "reopened", "closed":
 	default:
-		return "", false
+		return signalText{}, false
 	}
 
 	issue := p.Issue
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub issue: %s\n#%d %s: %s\nBy: %s",
-		repoName(p.Repository),
-		issue.Number,
-		p.Action,
-		truncate(orEmpty(issue.Title, "untitled"), 150),
-		actorName(issue.User, p.Sender),
-	)
-	appendURL(&b, issue.HTMLURL)
-	return b.String(), true
+	var w textBuilder
+	w.header(issueEmoji(p.Action), "Issue", repoName(p.Repository))
+	w.write("#")
+	w.bold(strconv.Itoa(issue.Number))
+	w.write(" ")
+	w.bold(p.Action)
+	w.write(": ")
+	w.prose(truncate(orEmpty(issue.Title, "untitled"), 150), p.Action == "closed")
+	w.nl()
+	w.field("By", actorName(issue.User, p.Sender))
+	w.link(issue.HTMLURL)
+	return w.done(), true
 }
 
-func buildCreateDeleteMessage(event string, p createDeletePayload) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub %s: %s\n%s %s\nBy: %s",
-		event,
-		repoName(p.Repository),
-		orEmpty(p.RefType, "ref"),
-		orEmpty(p.Ref, "unknown"),
-		actorName(p.Sender),
-	)
-	appendURL(&b, p.Repository.HTMLURL)
-	return b.String()
-}
-
-func buildStarMessage(p starPayload) (string, bool) {
-	if p.Action != "created" {
-		return "", false
+func buildCreateDeleteMessage(event string, p createDeletePayload) signalText {
+	emoji := "🌿"
+	title := "Created"
+	if event == "delete" {
+		emoji = "🗑️"
+		title = "Deleted"
+	} else if p.RefType == "tag" {
+		emoji = "🏷️"
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub star: %s\nBy: %s", repoName(p.Repository), actorName(p.Sender))
-	appendURL(&b, p.Repository.HTMLURL)
-	return b.String(), true
+
+	var w textBuilder
+	w.header(emoji, title, repoName(p.Repository))
+	w.write(orEmpty(p.RefType, "ref"))
+	w.write(" ")
+	w.mono(orEmpty(p.Ref, "unknown"))
+	w.nl()
+	w.field("By", actorName(p.Sender))
+	w.link(p.Repository.HTMLURL)
+	return w.done()
 }
 
-func buildForkMessage(p forkPayload) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "GitHub fork: %s\nTo: %s\nBy: %s",
-		repoName(p.Repository),
-		orEmpty(p.Forkee.FullName, "unknown"),
-		actorName(p.Sender),
-	)
-	appendURL(&b, p.Forkee.HTMLURL, p.Repository.HTMLURL)
-	return b.String()
+func buildStarMessage(p starPayload) (signalText, bool) {
+	if p.Action != "created" {
+		return signalText{}, false
+	}
+	var w textBuilder
+	w.header("⭐", "Star", repoName(p.Repository))
+	w.field("By", actorName(p.Sender))
+	w.link(p.Repository.HTMLURL)
+	return w.done(), true
 }
 
-// buildMessage returns a Signal notification body and whether one should be sent.
-func buildMessage(event string, body []byte) (string, bool, error) {
+func buildForkMessage(p forkPayload) signalText {
+	var w textBuilder
+	w.header("🍴", "Fork", repoName(p.Repository))
+	w.field("To", orEmpty(p.Forkee.FullName, "unknown"))
+	w.field("By", actorName(p.Sender))
+	w.link(p.Forkee.HTMLURL, p.Repository.HTMLURL)
+	return w.done()
+}
+
+// buildMessage returns a Signal notification and whether one should be sent.
+func buildMessage(event string, body []byte) (signalText, bool, error) {
 	switch event {
 	case "ping":
-		return "", false, nil
+		return signalText{}, false, nil
 
 	case "push":
 		var p pushPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		return buildPushMessage(p), true, nil
 
 	case "workflow_run":
 		var p workflowRunPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildWorkflowRunMessage(p)
 		return msg, ok, nil
@@ -558,7 +751,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "check_run":
 		var p checkRunPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildCheckRunMessage(p)
 		return msg, ok, nil
@@ -566,7 +759,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "page_build":
 		var p pageBuildPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildPageBuildMessage(p)
 		return msg, ok, nil
@@ -574,7 +767,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "deployment_status":
 		var p deploymentStatusPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildDeploymentStatusMessage(p)
 		return msg, ok, nil
@@ -582,7 +775,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "pull_request":
 		var p pullRequestPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildPullRequestMessage(p)
 		return msg, ok, nil
@@ -590,7 +783,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "release":
 		var p releasePayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildReleaseMessage(p)
 		return msg, ok, nil
@@ -598,7 +791,7 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "issues":
 		var p issuesPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildIssuesMessage(p)
 		return msg, ok, nil
@@ -606,14 +799,14 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "create", "delete":
 		var p createDeletePayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		return buildCreateDeleteMessage(event, p), true, nil
 
 	case "star":
 		var p starPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		msg, ok := buildStarMessage(p)
 		return msg, ok, nil
@@ -621,29 +814,34 @@ func buildMessage(event string, body []byte) (string, bool, error) {
 	case "fork":
 		var p forkPayload
 		if err := json.Unmarshal(body, &p); err != nil {
-			return "", false, err
+			return signalText{}, false, err
 		}
 		return buildForkMessage(p), true, nil
 
 	default:
-		return "", false, nil
+		return signalText{}, false, nil
 	}
 }
 
-func sendSignal(cfg Config, message string) error {
+func sendSignal(cfg Config, message signalText) error {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return fmt.Errorf("generate request ID: %w", err)
 	}
 
+	params := map[string]any{
+		"recipient": []string{cfg.Recipient},
+		"message":   message.body,
+	}
+	if len(message.styles) > 0 {
+		params["textStyle"] = message.styles
+	}
+
 	requestBody, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"method":  "send",
-		"params": map[string]any{
-			"recipient": []string{cfg.Recipient},
-			"message":   message,
-		},
-		"id": hex.EncodeToString(id[:]),
+		"params":  params,
+		"id":      hex.EncodeToString(id[:]),
 	})
 	if err != nil {
 		return fmt.Errorf("encode RPC request: %w", err)
